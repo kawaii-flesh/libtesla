@@ -38,6 +38,7 @@
 #include <stack>
 #include <map>
 #include <filesystem>
+#include <malloc.h>
 
 // Define this makro before including tesla.hpp in your main file. If you intend
 // to use the tesla.hpp header in more than one source file, only define it once!
@@ -206,18 +207,6 @@ namespace tsl {
     namespace hlp {
 
         /**
-         * @brief Wrapper for service initialization
-         *
-         * @param f wrapped function
-         */
-        template<typename F>
-        static inline void doWithSmSession(F f) {
-            smInitialize();
-            f();
-            smExit();
-        }
-
-        /**
          * @brief Wrapper for sd card access using stdio
          * @note Consider using raw fs calls instead as they are faster and need less space
          *
@@ -376,11 +365,12 @@ namespace tsl {
             }
 
             /**
-             * @brief Read Tesla settings file
-             *
-             * @return Settings data
-             */
-            static IniData readOverlaySettings() {
+            * @brief Read settings file from given path
+            *
+            * @param path Path to the settings file
+            * @return Settings data
+            */
+            static IniData readSettings(const char* path) {
                 /* Open Sd card filesystem. */
                 FsFileSystem fsSdmc;
                 if (R_FAILED(fsOpenSdCardFileSystem(&fsSdmc)))
@@ -389,7 +379,7 @@ namespace tsl {
 
                 /* Open config file. */
                 FsFile fileConfig;
-                if (R_FAILED(fsFsOpenFile(&fsSdmc, CONFIG_FILE, FsOpenMode_Read, &fileConfig)))
+                if (R_FAILED(fsFsOpenFile(&fsSdmc, path, FsOpenMode_Read, &fileConfig)))
                     return {};
                 hlp::ScopeGuard fileGuard([&] { fsFileClose(&fileConfig); });
 
@@ -408,28 +398,101 @@ namespace tsl {
                 return parseIni(configFileData);
             }
 
+            static Result fsCreateParentDirectories(FsFileSystem* fs, const char* filepath) {
+                if (fs == NULL || filepath == NULL || filepath[0] != '/') {
+                    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+                }
+
+                size_t len = strlen(filepath) + 1;
+                char* path = (char*)malloc(len);
+                if (path == NULL) {
+                    return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+                }
+                strcpy(path, filepath);
+
+                Result rc = 0;
+                char* p = path + 1;
+                char* slash;
+
+                while ((slash = strchr(p, '/'))) {
+                    *slash = '\0';
+
+                    FsDirEntryType type;
+                    rc = fsFsGetEntryType(fs, path, &type);
+                    
+                    if (R_FAILED(rc)) {
+                        if (rc == 0x202) {
+                            rc = fsFsCreateDirectory(fs, path);
+                            if (R_FAILED(rc)) {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    } else if (type != FsDirEntryType_Dir) {
+                        rc = -1;
+                        break;
+                    }
+
+                    *slash = '/';
+                    p = slash + 1;
+                }
+
+                free(path);
+                return rc;
+            }
+
             /**
-             * @brief Replace Tesla settings file with new data
-             *
-             * @param iniData new data
-             */
-            static void writeOverlaySettings(IniData const &iniData) {
-                /* Open Sd card filesystem. */
+            * @brief Write settings data to given path
+            *
+            * @param path Path to the settings file
+            * @param iniData New data to write
+            */
+            static void writeSettings(const char* path, IniData const &iniData) {
+                /* Open SD card filesystem. */
                 FsFileSystem fsSdmc;
                 if (R_FAILED(fsOpenSdCardFileSystem(&fsSdmc)))
                     return;
                 hlp::ScopeGuard fsGuard([&] { fsFsClose(&fsSdmc); });
 
-                /* Open config file. */
+                /* Create file if it doesn't exist. */
+                fsCreateParentDirectories(&fsSdmc, path);
+                fsFsCreateFile(&fsSdmc, path, 0, 0); // Ignoring error intentionally
+
+                /* Open config file for writing. */
                 FsFile fileConfig;
-                if (R_FAILED(fsFsOpenFile(&fsSdmc, CONFIG_FILE, FsOpenMode_Write, &fileConfig)))
+                if (R_FAILED(fsFsOpenFile(&fsSdmc, path, FsOpenMode_Write | FsOpenMode_Append, &fileConfig)))
                     return;
                 hlp::ScopeGuard fileGuard([&] { fsFileClose(&fileConfig); });
 
+                /* Write ini data to file. */
                 std::string iniString = unparseIni(iniData);
+                Result rc = fsFileWrite(&fileConfig, 0, iniString.c_str(), iniString.length(), FsWriteOption_Flush);
+                if (R_FAILED(rc)) {
+                    printf("Error writing to file. Result code: 0x%x\n", rc);
+                    return;
+                }
 
-                fsFileWrite(&fileConfig, 0, iniString.c_str(), iniString.length(), FsWriteOption_Flush);
             }
+
+            /**
+            * @brief Read Tesla overlay settings file
+            *
+            * @return Settings data
+            */
+            static IniData readOverlaySettings() {
+                return readSettings(CONFIG_FILE);
+            }
+
+            /**
+            * @brief Replace Tesla overlay settings file with new data
+            *
+            * @param iniData New data
+            */
+            static void writeOverlaySettings(IniData const &iniData) {
+                writeSettings(CONFIG_FILE, iniData);
+            }
+
 
             /**
              * @brief Merge and save changes into Tesla settings file
@@ -1030,7 +1093,7 @@ namespace tsl {
 
                 cfg::LayerPosX = 0;
                 cfg::LayerPosY = 0;
-                cfg::FramebufferWidth  = 448;
+                cfg::FramebufferWidth  = 1280;
                 cfg::FramebufferHeight = 720;
                 cfg::LayerWidth  = cfg::ScreenHeight * (float(cfg::FramebufferWidth) / float(cfg::FramebufferHeight));
                 cfg::LayerHeight = cfg::ScreenHeight;
@@ -1038,35 +1101,33 @@ namespace tsl {
                 if (this->m_initialized)
                     return;
 
-                tsl::hlp::doWithSmSession([this]{
-                    ASSERT_FATAL(viInitialize(ViServiceType_Manager));
-                    ASSERT_FATAL(viOpenDefaultDisplay(&this->m_display));
-                    ASSERT_FATAL(viGetDisplayVsyncEvent(&this->m_display, &this->m_vsyncEvent));
-                    ASSERT_FATAL(viCreateManagedLayer(&this->m_display, static_cast<ViLayerFlags>(0), 0, &__nx_vi_layer_id));
-                    ASSERT_FATAL(viCreateLayer(&this->m_display, &this->m_layer));
-                    ASSERT_FATAL(viSetLayerScalingMode(&this->m_layer, ViScalingMode_FitToLayer));
+                ASSERT_FATAL(viInitialize(ViServiceType_Manager));
+                ASSERT_FATAL(viOpenDefaultDisplay(&this->m_display));
+                ASSERT_FATAL(viGetDisplayVsyncEvent(&this->m_display, &this->m_vsyncEvent));
+                ASSERT_FATAL(viCreateManagedLayer(&this->m_display, static_cast<ViLayerFlags>(0), 0, &__nx_vi_layer_id));
+                ASSERT_FATAL(viCreateLayer(&this->m_display, &this->m_layer));
+                ASSERT_FATAL(viSetLayerScalingMode(&this->m_layer, ViScalingMode_FitToLayer));
 
-                    if (s32 layerZ = 0; R_SUCCEEDED(viGetZOrderCountMax(&this->m_display, &layerZ)) && layerZ > 0)
-                        ASSERT_FATAL(viSetLayerZ(&this->m_layer, layerZ));
+                if (s32 layerZ = 0; R_SUCCEEDED(viGetZOrderCountMax(&this->m_display, &layerZ)) && layerZ > 0)
+                    ASSERT_FATAL(viSetLayerZ(&this->m_layer, layerZ));
 
-                    ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_Default));
-                    ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_Screenshot));
-                    ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_Recording));
-                    ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_Arbitrary));
-                    ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_LastFrame));
-                    ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_Null));
-                    ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_ApplicationForDebug));
-                    ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_Lcd));
-                    //ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, 8));
+                ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_Default));
+                ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_Screenshot));
+                ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_Recording));
+                ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_Arbitrary));
+                ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_LastFrame));
+                ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_Null));
+                ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_ApplicationForDebug));
+                ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, ViLayerStack_Lcd));
+                //ASSERT_FATAL(tsl::hlp::viAddToLayerStack(&this->m_layer, 8));
 
-                    ASSERT_FATAL(viSetLayerSize(&this->m_layer, cfg::LayerWidth, cfg::LayerHeight));
-                    ASSERT_FATAL(viSetLayerPosition(&this->m_layer, cfg::LayerPosX, cfg::LayerPosY));
-                    ASSERT_FATAL(nwindowCreateFromLayer(&this->m_window, &this->m_layer));
-                    ASSERT_FATAL(framebufferCreate(&this->m_framebuffer, &this->m_window, cfg::FramebufferWidth, cfg::FramebufferHeight, PIXEL_FORMAT_RGBA_4444, 2));
-                    ASSERT_FATAL(setInitialize());
-                    ASSERT_FATAL(this->initFonts());
-                    setExit();
-                });
+                ASSERT_FATAL(viSetLayerSize(&this->m_layer, cfg::LayerWidth, cfg::LayerHeight));
+                ASSERT_FATAL(viSetLayerPosition(&this->m_layer, cfg::LayerPosX, cfg::LayerPosY));
+                ASSERT_FATAL(nwindowCreateFromLayer(&this->m_window, &this->m_layer));
+                ASSERT_FATAL(framebufferCreate(&this->m_framebuffer, &this->m_window, cfg::FramebufferWidth, cfg::FramebufferHeight, PIXEL_FORMAT_RGBA_4444, 2));
+                ASSERT_FATAL(setInitialize());
+                ASSERT_FATAL(this->initFonts());
+                setExit();
 
                 this->m_initialized = true;
             }
@@ -3000,6 +3061,18 @@ namespace tsl {
             return std::make_unique<T>(args...);
         }
 
+        /**
+         * @brief Clears the screen
+         *
+         */
+        void clearScreen() {
+            auto& renderer = gfx::Renderer::get();
+
+            renderer.startFrame();
+            renderer.clearScreen();
+            renderer.endFrame();
+        }
+
     private:
         using GuiPtr = std::unique_ptr<tsl::Gui>;
         std::stack<GuiPtr, std::list<GuiPtr>> m_guiStack;
@@ -3232,18 +3305,6 @@ namespace tsl {
             }
 
             oldTouchDetected = touchDetected;
-        }
-
-        /**
-         * @brief Clears the screen
-         *
-         */
-        void clearScreen() {
-            auto& renderer = gfx::Renderer::get();
-
-            renderer.startFrame();
-            renderer.clearScreen();
-            renderer.endFrame();
         }
 
         /**
@@ -3532,7 +3593,7 @@ namespace tsl {
         overlay = new TOverlay();
         overlay->m_closeOnExit = (u8(launchFlags) & u8(impl::LaunchFlags::CloseOnExit)) == u8(impl::LaunchFlags::CloseOnExit);
 
-        tsl::hlp::doWithSmSession([&overlay]{ overlay->initServices(); });
+        overlay->initServices();
         overlay->initScreen();
         overlay->changeTo(overlay->loadInitialGui());
 
@@ -3621,24 +3682,29 @@ extern "C" {
     u32 __nx_fs_num_sessions = 1;
     u32  __nx_nv_transfermem_size = 0x40000;
     ViLayerFlags __nx_vi_stray_layer_flags = (ViLayerFlags)0;
+    static int nxlink_sock = -1;
 
     /**
      * @brief libtesla service initializing function to override libnx's
      *
      */
     void __appInit(void) {
-        tsl::hlp::doWithSmSession([]{
-            ASSERT_FATAL(fsInitialize());
-            ASSERT_FATAL(hidInitialize());                          // Controller inputs and Touch
-            if (hosversionAtLeast(16,0,0)) {
-                ASSERT_FATAL(plInitialize(PlServiceType_User));     // Font data. Use pl:u for 16.0.0+
-            } else {
-                ASSERT_FATAL(plInitialize(PlServiceType_System));   // Use pl:s for 15.0.1 and below to prevent qlaunch/overlaydisp session exhaustion
-            }
-            ASSERT_FATAL(pmdmntInitialize());                       // PID querying
-            ASSERT_FATAL(hidsysInitialize());                       // Focus control
-            ASSERT_FATAL(setsysInitialize());                       // Settings querying
-        });
+        smInitialize();
+        ASSERT_FATAL(fsInitialize());
+        ASSERT_FATAL(hidInitialize());                          // Controller inputs and Touch
+        if (hosversionAtLeast(16,0,0)) {
+            ASSERT_FATAL(plInitialize(PlServiceType_User));     // Font data. Use pl:u for 16.0.0+
+        } else {
+            ASSERT_FATAL(plInitialize(PlServiceType_System));   // Use pl:s for 15.0.1 and below to prevent qlaunch/overlaydisp session exhaustion
+        }
+        ASSERT_FATAL(pmdmntInitialize());                       // PID querying
+        ASSERT_FATAL(hidsysInitialize());                       // Focus control
+        ASSERT_FATAL(setsysInitialize());                       // Settings querying
+        socketInitializeDefault();
+        #ifdef DEBUG
+            nxlink_sock = nxlinkStdio();
+        #endif
+
     }
 
     /**
@@ -3646,12 +3712,16 @@ extern "C" {
      *
      */
     void __appExit(void) {
+        smExit();
         fsExit();
         hidExit();
         plExit();
         pmdmntExit();
         hidsysExit();
         setsysExit();
+        if (nxlink_sock != -1)
+            close(nxlink_sock);
+        socketExit();
     }
 
 }
