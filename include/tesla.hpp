@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <switch.h>
 
 #include <stdlib.h>
@@ -89,8 +90,6 @@ namespace tsl {
         extern u16 LayerPosY;                   ///< Y position of the Tesla layer
         extern u16 FramebufferWidth;            ///< Width of the framebuffer
         extern u16 FramebufferHeight;           ///< Height of the framebuffer
-        extern u64 launchCombo;                 ///< Overlay activation key combo
-
     }
 
     /**
@@ -313,11 +312,6 @@ namespace tsl {
             using IniData = std::map<std::string, std::map<std::string, std::string>>;
 
             /**
-             * @brief Tesla config file
-             */
-            static const char* CONFIG_FILE = "/config/tesla/config.ini";
-
-            /**
              * @brief Parses a ini string
              *
              * @param str String to parse
@@ -370,7 +364,7 @@ namespace tsl {
             * @param path Path to the settings file
             * @return Settings data
             */
-            static IniData readSettings(const char* path) {
+            [[maybe_unused]] static IniData readSettings(const char* path) {
                 /* Open Sd card filesystem. */
                 FsFileSystem fsSdmc;
                 if (R_FAILED(fsOpenSdCardFileSystem(&fsSdmc)))
@@ -448,7 +442,7 @@ namespace tsl {
             * @param path Path to the settings file
             * @param iniData New data to write
             */
-            static void writeSettings(const char* path, IniData const &iniData) {
+            [[maybe_unused]] static void writeSettings(const char* path, IniData const &iniData) {
                 /* Open SD card filesystem. */
                 FsFileSystem fsSdmc;
                 if (R_FAILED(fsOpenSdCardFileSystem(&fsSdmc)))
@@ -474,41 +468,6 @@ namespace tsl {
                 }
 
             }
-
-            /**
-            * @brief Read Tesla overlay settings file
-            *
-            * @return Settings data
-            */
-            static IniData readOverlaySettings() {
-                return readSettings(CONFIG_FILE);
-            }
-
-            /**
-            * @brief Replace Tesla overlay settings file with new data
-            *
-            * @param iniData New data
-            */
-            static void writeOverlaySettings(IniData const &iniData) {
-                writeSettings(CONFIG_FILE, iniData);
-            }
-
-
-            /**
-             * @brief Merge and save changes into Tesla settings file
-             *
-             * @param changes setting values to add or update
-             */
-            static void updateOverlaySettings(IniData const &changes) {
-                hlp::ini::IniData iniData = hlp::ini::readOverlaySettings();
-                for (auto &section : changes) {
-                    for (auto &keyValue : section.second) {
-                        iniData[section.first][keyValue.first] = keyValue.second;
-                    }
-                }
-                writeOverlaySettings(iniData);
-            }
-
         }
 
         /**
@@ -531,32 +490,13 @@ namespace tsl {
          * @param value Combo string
          * @return Key codes
          */
-        static u64 comboStringToKeys(const std::string &value) {
+         [[maybe_unused]] static u64 comboStringToKeys(const std::string &value) {
             u64 keyCombo = 0x00;
             for (std::string key : hlp::split(value, '+')) {
                 keyCombo |= hlp::stringToKeyCode(key);
             }
             return keyCombo;
         }
-
-        /**
-         * @brief Encodes key codes into a combo string
-         *
-         * @param keys Key codes
-         * @return Combo string
-         */
-        static std::string keysToComboString(u64 keys) {
-            std::string str;
-            for (auto &keyInfo : impl::KEYS_INFO) {
-                if (keys & keyInfo.key) {
-                    if (!str.empty())
-                        str.append("+");
-                    str.append(keyInfo.name);
-                }
-            }
-            return str;
-        }
-
     }
 
     // Renderer
@@ -3282,22 +3222,7 @@ namespace tsl {
                     topElement->onTouch(touchEvent, touchPos.x, touchPos.y, oldTouchPos.x, oldTouchPos.y, initialTouchPos.x, initialTouchPos.y);
 
                 oldTouchPos = touchPos;
-
-                // Hide overlay when touching out of bounds
-                if (touchPos.x >= cfg::FramebufferWidth) {
-                    if (tsl::elm::Element::getInputMode() == tsl::InputMode::Touch) {
-                        oldTouchPos = { 0 };
-                        initialTouchPos = { 0 };
-
-                        this->hide();
-                    }
-                }
             } else {
-                if (oldTouchPos.x < 150U && oldTouchPos.y > cfg::FramebufferHeight - 73U)
-                    if (initialTouchPos.x < 150U && initialTouchPos.y > cfg::FramebufferHeight - 73U)
-                        if (!currentGui->handleInput(HidNpadButton_B, 0,{},{},{}))
-                            this->goBack();
-
                 elm::Element::setInputMode(InputMode::Controller);
 
                 oldTouchPos = { 0 };
@@ -3392,8 +3317,6 @@ namespace tsl {
         struct SharedThreadData {
             bool running = false;
 
-            Event comboEvent = { 0 };
-
             bool overlayOpen = false;
 
             std::mutex dataMutex;
@@ -3404,33 +3327,6 @@ namespace tsl {
             HidAnalogStickState joyStickPosLeft = { 0 }, joyStickPosRight = { 0 };
         };
 
-
-        /**
-         * @brief Extract values from Tesla settings file
-         *
-         */
-        static void parseOverlaySettings() {
-            hlp::ini::IniData parsedConfig = hlp::ini::readOverlaySettings();
-
-            u64 decodedKeys = hlp::comboStringToKeys(parsedConfig["tesla"]["key_combo"]);
-            if (decodedKeys)
-                tsl::cfg::launchCombo = decodedKeys;
-        }
-
-        /**
-         * @brief Update and save launch combo keys
-         *
-         * @param keys the new combo keys
-         */
-        [[maybe_unused]] static void updateCombo(u64 keys) {
-            tsl::cfg::launchCombo = keys;
-            hlp::ini::updateOverlaySettings({
-                { "tesla", {
-                    { "key_combo", tsl::hlp::keysToComboString(keys) }
-                }}
-            });
-        }
-
         /**
          * @brief Background event polling loop thread
          *
@@ -3438,21 +3334,6 @@ namespace tsl {
          */
         static void backgroundEventPoller(void *args) {
             SharedThreadData *shData = static_cast<SharedThreadData*>(args);
-
-            // To prevent focus glitchout, close the overlay immediately when the home button gets pressed
-            Event homeButtonPressEvent = {};
-            hidsysAcquireHomeButtonEventHandle(&homeButtonPressEvent, false);
-            eventClear(&homeButtonPressEvent);
-            hlp::ScopeGuard homeButtonEventGuard([&] { eventClose(&homeButtonPressEvent); });
-
-            // To prevent focus glitchout, close the overlay immediately when the power button gets pressed
-            Event powerButtonPressEvent = {};
-            hidsysAcquireSleepButtonEventHandle(&powerButtonPressEvent, false);
-            eventClear(&powerButtonPressEvent);
-            hlp::ScopeGuard powerButtonEventGuard([&] { eventClose(&powerButtonPressEvent); });
-
-            // Parse Tesla settings
-            impl::parseOverlaySettings();
 
             // Configure input to take all controllers and up to 8
             padConfigureInput(8, HidNpadStyleSet_NpadStandard | HidNpadStyleTag_NpadSystemExt);
@@ -3466,19 +3347,6 @@ namespace tsl {
 
             // Drop all inputs from the previous overlay
             padUpdate(&pad);
-
-            enum WaiterObject {
-                WaiterObject_HomeButton,
-                WaiterObject_PowerButton,
-
-                WaiterObject_Count
-            };
-
-            // Construct waiter
-            Waiter objects[2] = {
-                [WaiterObject_HomeButton] = waiterForEvent(&homeButtonPressEvent),
-                [WaiterObject_PowerButton] = waiterForEvent(&powerButtonPressEvent),
-            };
 
             while (shData->running) {
                 // Scan for input changes
@@ -3497,38 +3365,10 @@ namespace tsl {
                     if (hidGetTouchScreenStates(&shData->touchState, 1) == 0)
                         shData->touchState = { 0 };
 
-                    if (((shData->keysHeld & tsl::cfg::launchCombo) == tsl::cfg::launchCombo) && shData->keysDown & tsl::cfg::launchCombo) {
-                        if (shData->overlayOpen) {
-                            tsl::Overlay::get()->hide();
-                            shData->overlayOpen = false;
-                        }
-                        else
-                            eventFire(&shData->comboEvent);
-                    }
-
                     shData->keysDownPending |= shData->keysDown;
                 }
 
-                //20 ms
-                s32 idx = 0;
-                Result rc = waitObjects(&idx, objects, WaiterObject_Count, 20'000'000ul);
-                if (R_SUCCEEDED(rc)) {
-                    if (shData->overlayOpen) {
-                        tsl::Overlay::get()->hide();
-                        shData->overlayOpen = false;
-                    }
-
-                    switch (idx) {
-                        case WaiterObject_HomeButton:
-                            eventClear(&homeButtonPressEvent);
-                            break;
-                        case WaiterObject_PowerButton:
-                            eventClear(&powerButtonPressEvent);
-                            break;
-                    }
-                } else if (rc != KERNELRESULT(TimedOut)) {
-                    ASSERT_FATAL(rc);
-                }
+                svcSleepThread(20'000'000ul);
             }
         }
 
@@ -3587,8 +3427,6 @@ namespace tsl {
         threadCreate(&backgroundThread, impl::backgroundEventPoller, &shData, nullptr, 0x1000, 0x2c, -2);
         threadStart(&backgroundThread);
 
-        eventCreate(&shData.comboEvent, false);
-
         auto& overlay = tsl::Overlay::s_overlayInstance;
         overlay = new TOverlay();
         overlay->m_closeOnExit = (u8(launchFlags) & u8(impl::LaunchFlags::CloseOnExit)) == u8(impl::LaunchFlags::CloseOnExit);
@@ -3598,23 +3436,8 @@ namespace tsl {
         overlay->changeTo(overlay->loadInitialGui());
 
 
-        // Argument parsing
-        for (u8 arg = 0; arg < argc; arg++) {
-            if (strcasecmp(argv[arg], "--skipCombo") == 0) {
-                eventFire(&shData.comboEvent);
-                overlay->disableNextAnimation();
-            }
-        }
-
-
         while (shData.running) {
-
-            eventWait(&shData.comboEvent, UINT64_MAX);
-            eventClear(&shData.comboEvent);
             shData.overlayOpen = true;
-
-
-            hlp::requestForeground(true);
 
             overlay->show();
             overlay->clearScreen();
@@ -3644,10 +3467,7 @@ namespace tsl {
             hlp::requestForeground(false);
 
             shData.overlayOpen = false;
-            eventClear(&shData.comboEvent);
         }
-
-        eventClose(&shData.comboEvent);
 
         threadWaitForExit(&backgroundThread);
         threadClose(&backgroundThread);
